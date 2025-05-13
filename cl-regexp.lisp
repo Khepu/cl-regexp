@@ -23,34 +23,37 @@
 (defstruct backreference
   index)
 
+(defstruct bracket-group
+  negate-p
+  chars)
+
 (defun tokenize (string)
   (loop with mode = nil
         for char across string
-        for token =
-                  (case mode
-                    (:escaping
-                     (setf mode nil)
-                     (if (digit-char-p char)
-                         (cons :backreference (- (char-code char) (char-code #\0)))
-                         (case char
-                           (#\t (cons :literal #\tab))
-                           (#\n (cons :literal #\newline))
-                           (t (cons :literal char)))))
-                    (t
-                     (case char
-                       (#\\ (setf mode :escaping) nil)
-                       (#\^ :caret)
-                       (#\$ :dollar)
-                       (#\( :group-start)
-                       (#\) :group-end)
-                       (#\[ :bracket-open)
-                       (#\] :bracket-close)
-                       (#\* :kleene)
-                       (#\| :either)
-                       (#\+ :plus)
-                       (#\? :q-mark)
-                       (#\. :dot)
-                       (t (cons :literal char)))))
+        for token = (case mode
+                      (:escaping
+                       (setf mode nil)
+                       (if (digit-char-p char)
+                           (cons :backreference (- #.(char-code char) (char-code #\0)))
+                           (case char
+                             (#\t (cons :literal #\tab))
+                             (#\n (cons :literal #\newline))
+                             (t (cons :literal char)))))
+                      (t
+                       (case char
+                         (#\\ (setf mode :escaping) nil)
+                         (#\^ :caret)
+                         (#\$ :dollar)
+                         (#\( :group-start)
+                         (#\) :group-end)
+                         (#\[ :bracket-open)
+                         (#\] :bracket-close)
+                         (#\* :kleene)
+                         (#\| :either)
+                         (#\+ :plus)
+                         (#\? :q-mark)
+                         (#\. :dot)
+                         (t (cons :literal char)))))
         when token
           collect it
         finally (when (eq mode :escaping)
@@ -81,13 +84,14 @@
 
 (defun repeat-rightmost-expr (state min max)
   (typecase state
-    ((or group literal)
+    ((or group literal backreference)
      (make-repeat :expr state :min min :max max))
     (t
      (loop with current-state = state
            do (typecase current-state
                 (concat (if (or (literal-p (concat-right current-state))
-                                (group-p (concat-right current-state)))
+                                (group-p (concat-right current-state))
+                                (backreference-p (concat-right current-state)))
                             (progn
                               (setf (concat-right current-state)
                                     (make-repeat :expr (concat-right current-state)
@@ -97,7 +101,8 @@
                                 state))
                             (setf current-state (concat-right current-state))))
                 (either (if (or (literal-p (either-right current-state))
-                                (group-p (either-right current-state)))
+                                (group-p (either-right current-state))
+                                (backreference-p (either-right current-state)))
                             (progn
                               (setf (either-right current-state)
                                     (make-repeat :expr (either-right current-state)

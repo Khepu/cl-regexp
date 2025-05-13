@@ -17,33 +17,43 @@
   max)
 
 (defstruct group
-  expr)
+  expr
+  index)
+
+(defstruct backreference
+  index)
 
 (defun tokenize (string)
-  (loop with escaping-p = nil
+  (loop with mode = nil
         for char across string
-        for token = (if (not escaping-p)
-                        (case char
-                          (#\\ (setf escaping-p t) nil)
-                          (#\( :group-start)
-                          (#\) :group-end)
-                          (#\* :kleene)
-                          (#\| :either)
-                          (#\+ :plus)
-                          (#\? :q-mark)
-                          (#\. :dot)
-                          (t (cons :literal char)))
-                        (progn
-                          (setf escaping-p nil)
-                          (if (digit-char-p char)
-                              (error "Unsupported") ;;(cons :backreference ....)
-                              (case char
-                                (#\t (cons :literal #\tab))
-                                (#\n (cons :literal #\newline))
-                                (t (cons :literal char))))))
+        for token =
+                  (case mode
+                    (:escaping
+                     (setf mode nil)
+                     (if (digit-char-p char)
+                         (cons :backreference (- (char-code char) (char-code #\0)))
+                         (case char
+                           (#\t (cons :literal #\tab))
+                           (#\n (cons :literal #\newline))
+                           (t (cons :literal char)))))
+                    (t
+                     (case char
+                       (#\\ (setf mode :escaping) nil)
+                       (#\^ :caret)
+                       (#\$ :dollar)
+                       (#\( :group-start)
+                       (#\) :group-end)
+                       (#\[ :bracket-open)
+                       (#\] :bracket-close)
+                       (#\* :kleene)
+                       (#\| :either)
+                       (#\+ :plus)
+                       (#\? :q-mark)
+                       (#\. :dot)
+                       (t (cons :literal char)))))
         when token
           collect it
-        finally (when escaping-p
+        finally (when (eq mode :escaping)
                   (error "Tokenization Error: Dangling backslash!"))))
 
 (defun make-buffer ()
@@ -69,37 +79,81 @@
                             :right literal))))
         state)))
 
-(defun repeat-rightmost-expr (state)
-  (loop with current-state = state
-        do (typecase current-state
-             (concat (if (literal-p (concat-right current-state))
-                         (return-from repeat-rightmost-expr
-                           (setf (concat-right current-state)
-                                 (make-repeat :expr (concat-right current-state))))
-                         (setf current-state (concat-right current-state))))
-             (either (if (literal-p (either-right current-state))
-                         (return-from repeat-rightmost-expr
-                           (setf (either-right current-state)
-                                 (make-repeat :expr (either-right current-state))))
-                         (setf current-state (either-right current-state)))))))
+(defun repeat-rightmost-expr (state min max)
+  (typecase state
+    ((or group literal)
+     (make-repeat :expr state :min min :max max))
+    (t
+     (loop with current-state = state
+           do (typecase current-state
+                (concat (if (or (literal-p (concat-right current-state))
+                                (group-p (concat-right current-state)))
+                            (progn
+                              (setf (concat-right current-state)
+                                    (make-repeat :expr (concat-right current-state)
+                                                 :min min
+                                                 :max max))
+                              (return-from repeat-rightmost-expr
+                                state))
+                            (setf current-state (concat-right current-state))))
+                (either (if (or (literal-p (either-right current-state))
+                                (group-p (either-right current-state)))
+                            (progn
+                              (setf (either-right current-state)
+                                    (make-repeat :expr (either-right current-state)
+                                                 :min min
+                                                 :max max))
+                              (return-from repeat-rightmost-expr
+                                state))
+                            (setf current-state (either-right current-state)))))))))
 
 (defun parse (tokens)
-  (loop with state = nil
+  (loop with group-index = 1
+        with state = nil
         with groups = nil
         with buffer = nil
         for (current next) on tokens
-        ;;do (format t "TOKEN: ~s NEXT: ~s STATE: ~s BUFFER: ~S ~%" current next state buffer)
         do (case (if (consp current)
                      (car current)
                      current)
+             (:group-start
+              (setf state (finalize-buffer buffer state)
+                    buffer nil)
+              (push state groups)
+              (setf state nil)
+              (incf group-index))
+             (:group-end
+              (setf state
+                    (let ((context (pop groups))
+                          (group (make-group :expr (finalize-buffer buffer state)
+                                             :index (decf group-index))))
+                      (typecase context
+                        (concat (if (concat-right context)
+                                    (make-concat :left context :right group)
+                                    (setf (concat-right context) group)))
+                        (either (if (either-right context)
+                                    (make-concat :left context :right group)
+                                    (setf (either-right context) group)))
+                        (null group)
+                        (t (make-concat :left context :right group))))
+                    buffer nil))
+             (:backreference
+              (setq current (cdr current))
+              (let ((backreference (make-backreference :index current)))
+                (setf state
+                      (typecase state
+                        (concat (if (concat-right state)
+                                    (make-concat :left state :right backreference)
+                                    (setf (concat-right state) backreference)))
+                        (either (if (either-right state)
+                                    (make-concat :left state :right backreference)
+                                    (setf (either-right state) backreference)))
+                        (null backreference)
+                        (t (make-concat :left state :right backreference))))))
              (:either (setf state (make-either :left state)))
-             (:kleene (let ((repeat (repeat-rightmost-expr state)))
-                        (setf (repeat-min repeat) 0)))
-             (:q-mark (let ((repeat (repeat-rightmost-expr state)))
-                        (setf (repeat-min repeat) 0
-                              (repeat-max repeat) 1)))
-             (:plus (let ((repeat (repeat-rightmost-expr state)))
-                      (setf (repeat-min repeat) 1)))
+             (:kleene (setf state (repeat-rightmost-expr state 0 nil)))
+             (:q-mark (setf state (repeat-rightmost-expr state 0 1)))
+             (:plus   (setf state (repeat-rightmost-expr state 1 nil)))
              (:literal
               (setq current (cdr current))
               (case next
@@ -119,9 +173,11 @@
                                                    :right literal)
                                       literal))
                             state)
-                           ((or literal repeat concat) (make-concat :left state
-                                                                    :right literal))
-                           (nil literal)))))
+
+                           ((or literal repeat concat)
+                            (make-concat :left state :right literal))
+
+                           (null literal)))))
 
                 (:either
                  (unless buffer

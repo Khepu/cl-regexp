@@ -27,38 +27,6 @@
   negate-p
   chars)
 
-(defun tokenize (string)
-  (loop with mode = nil
-        for char across string
-        for token = (case mode
-                      (:escaping
-                       (setf mode nil)
-                       (if (digit-char-p char)
-                           (cons :backreference (- #.(char-code char) (char-code #\0)))
-                           (case char
-                             (#\t (cons :literal #\tab))
-                             (#\n (cons :literal #\newline))
-                             (t (cons :literal char)))))
-                      (t
-                       (case char
-                         (#\\ (setf mode :escaping) nil)
-                         (#\^ :caret)
-                         (#\$ :dollar)
-                         (#\( :group-start)
-                         (#\) :group-end)
-                         (#\[ :bracket-open)
-                         (#\] :bracket-close)
-                         (#\* :kleene)
-                         (#\| :either)
-                         (#\+ :plus)
-                         (#\? :q-mark)
-                         (#\. :dot)
-                         (t (cons :literal char)))))
-        when token
-          collect it
-        finally (when (eq mode :escaping)
-                  (error "Tokenization Error: Dangling backslash!"))))
-
 (defun make-buffer ()
   (make-array (list 1)
               :element-type 'character
@@ -66,6 +34,23 @@
               :fill-pointer 0))
 
 (defun finalize-buffer (buffer state)
+  (let ((string (when buffer
+                  (coerce buffer 'string))))
+    (if string
+        (let ((literal (make-literal :text string)))
+          (typecase state
+            (either (if (either-right state)
+                        (make-concat :left state
+                                     :right literal)
+                        (progn
+                          (setf (either-right state) literal)
+                          state)))
+            (null literal)
+            (t (make-concat :left state
+                            :right literal))))
+        state)))
+
+(defun finalize-bracket (buffer state)
   (let ((string (when buffer
                   (coerce buffer 'string))))
     (if string
@@ -132,6 +117,23 @@
                     (let ((context (pop groups))
                           (group (make-group :expr (finalize-buffer buffer state)
                                              :index (decf group-index))))
+                      (typecase context
+                        (concat (if (concat-right context)
+                                    (make-concat :left context :right group)
+                                    (setf (concat-right context) group)))
+                        (either (if (either-right context)
+                                    (make-concat :left context :right group)
+                                    (setf (either-right context) group)))
+                        (null group)
+                        (t (make-concat :left context :right group))))
+                    buffer nil))
+             (:bracket-open
+
+              )
+             (:bracket-close
+              (setf state
+                    (let ((context (pop groups))
+                          (group (make-bracket-group :chars buffer)))
                       (typecase context
                         (concat (if (concat-right context)
                                     (make-concat :left context :right group)

@@ -4,8 +4,7 @@
   text)
 
 (defstruct concat
-  left
-  right)
+  children)
 
 (defstruct either
   left
@@ -17,7 +16,7 @@
   max)
 
 (defstruct group
-  expr
+  expr ;; in reverse order
   index)
 
 (defstruct backreference
@@ -33,169 +32,83 @@
               :adjustable t
               :fill-pointer 0))
 
-(defun finalize-buffer (buffer state)
-  (let ((string (when buffer
-                  (coerce buffer 'string))))
-    (if string
-        (let ((literal (make-literal :text string)))
-          (typecase state
-            (either (if (either-right state)
-                        (make-concat :left state
-                                     :right literal)
-                        (progn
-                          (setf (either-right state) literal)
-                          state)))
-            (null literal)
-            (t (make-concat :left state
-                            :right literal))))
-        state)))
+(defun buffer->literal (buffer)
+  (when (plusp (length buffer))
+    (make-literal :text (coerce buffer 'string))))
 
-(defun finalize-bracket (buffer state)
-  (let ((string (when buffer
-                  (coerce buffer 'string))))
-    (if string
-        (let ((literal (make-literal :text string)))
-          (typecase state
-            (either (if (either-right state)
-                        (make-concat :left state
-                                     :right literal)
-                        (progn
-                          (setf (either-right state) literal)
-                          state)))
-            (null literal)
-            (t (make-concat :left state
-                            :right literal))))
-        state)))
+(defun repeat-last (state min max)
+  (with-slots (root) state
+    (let ((last (pop (concat-children root))))
+      (push (make-repeat :expr last
+                         :min min
+                         :max max)
+            (concat-children root)))))
 
-(defun repeat-rightmost-expr (state min max)
-  (typecase state
-    ((or group literal backreference)
-     (make-repeat :expr state :min min :max max))
-    (t
-     (loop with current-state = state
-           do (typecase current-state
-                (concat (if (or (literal-p (concat-right current-state))
-                                (group-p (concat-right current-state))
-                                (backreference-p (concat-right current-state)))
-                            (progn
-                              (setf (concat-right current-state)
-                                    (make-repeat :expr (concat-right current-state)
-                                                 :min min
-                                                 :max max))
-                              (return-from repeat-rightmost-expr
-                                state))
-                            (setf current-state (concat-right current-state))))
-                (either (if (or (literal-p (either-right current-state))
-                                (group-p (either-right current-state))
-                                (backreference-p (either-right current-state)))
-                            (progn
-                              (setf (either-right current-state)
-                                    (make-repeat :expr (either-right current-state)
-                                                 :min min
-                                                 :max max))
-                              (return-from repeat-rightmost-expr
-                                state))
-                            (setf current-state (either-right current-state)))))))))
+(defstruct state
+  (root (make-concat))
+  (buffer (make-buffer))
+  groups
+  (group-index 1))
+
+(defun carry-over-buffer (state)
+  (with-slots (root buffer) state
+    (let ((literal (buffer->literal buffer)))
+      (when literal
+        ;; (format t "ADDING LITERAL: ~s~%" literal)
+        (push literal (concat-children root))
+        (setf buffer (make-buffer))))))
+
+(defun reconstruct (marker state)
+  (with-slots (root groups group-index) state
+    (loop for (type . group) = (pop groups)
+          ;; do (format t "RECONSTRUCT: ~s~%" state)
+          when type
+            do (case type
+                 (:either (setf root (make-either :left group :right root)))
+                 (:group  (push (make-group :expr root
+                                            :index (decf group-index))
+                                (concat-children group))
+                  (setf root group)))
+          until (eq marker type))))
+
+(defun shelve (state type)
+  (with-slots (root groups group-index) state
+    (carry-over-buffer state)
+    (push (cons type root) groups)
+    (setf root (make-concat))
+    (when (eq type :group)
+      (incf group-index))))
+
+(defun unshelve (state type)
+  (carry-over-buffer state)
+  (reconstruct type state))
 
 (defun parse (tokens)
-  (loop with group-index = 1
-        with state = nil
-        with groups = nil
-        with buffer = nil
+  (loop with state = (make-state)
         for (current next) on tokens
+        ;; do (format t "MAIN LOOP: ~s~%" state)
         do (case (if (consp current)
                      (car current)
                      current)
-             (:group-start
-              (setf state (finalize-buffer buffer state)
-                    buffer nil)
-              (push state groups)
-              (setf state nil)
-              (incf group-index))
-             (:group-end
-              (setf state
-                    (let ((context (pop groups))
-                          (group (make-group :expr (finalize-buffer buffer state)
-                                             :index (decf group-index))))
-                      (typecase context
-                        (concat (if (concat-right context)
-                                    (make-concat :left context :right group)
-                                    (setf (concat-right context) group)))
-                        (either (if (either-right context)
-                                    (make-concat :left context :right group)
-                                    (setf (either-right context) group)))
-                        (null group)
-                        (t (make-concat :left context :right group))))
-                    buffer nil))
-             (:bracket-open
-
-              )
-             (:bracket-close
-              (setf state
-                    (let ((context (pop groups))
-                          (group (make-bracket-group :chars buffer)))
-                      (typecase context
-                        (concat (if (concat-right context)
-                                    (make-concat :left context :right group)
-                                    (setf (concat-right context) group)))
-                        (either (if (either-right context)
-                                    (make-concat :left context :right group)
-                                    (setf (either-right context) group)))
-                        (null group)
-                        (t (make-concat :left context :right group))))
-                    buffer nil))
-             (:backreference
-              (setq current (cdr current))
-              (let ((backreference (make-backreference :index current)))
-                (setf state
-                      (typecase state
-                        (concat (if (concat-right state)
-                                    (make-concat :left state :right backreference)
-                                    (setf (concat-right state) backreference)))
-                        (either (if (either-right state)
-                                    (make-concat :left state :right backreference)
-                                    (setf (either-right state) backreference)))
-                        (null backreference)
-                        (t (make-concat :left state :right backreference))))))
-             (:either (setf state (make-either :left state)))
-             (:kleene (setf state (repeat-rightmost-expr state 0 nil)))
-             (:q-mark (setf state (repeat-rightmost-expr state 0 1)))
-             (:plus   (setf state (repeat-rightmost-expr state 1 nil)))
+             (:group-start (shelve state :group))
+             (:group-end   (unshelve state :group))
+             (:either      (shelve state :either))
+             (:dot    (push :dot (concat-children (state-root state))))
+             (:kleene (repeat-last state 0 nil))
+             (:q-mark (repeat-last state 0 1))
+             (:plus   (repeat-last state 1 nil))
              (:literal
               (setq current (cdr current))
               (case next
-                ;; if :KLEENE follows after a :LITERAL then we need to:
-                ;; 1. finalize the existing buffer
-                ;; 2. modify the state to reflect the literal added
+                ;; if :KLEENE follows after a :LITERAL then we need to break up
+                ;; the string
                 ((:kleene :q-mark :plus)
-                 (setf state (finalize-buffer buffer state)
-                       buffer nil)
-                 (let ((literal (make-literal :text (format nil "~a" current))))
-                   (setf state
-                         (typecase state
-                           (either
-                            (setf (either-right state)
-                                  (if (either-right state)
-                                      (make-concat :left (either-right state)
-                                                   :right literal)
-                                      literal))
-                            state)
-
-                           ((or literal repeat concat)
-                            (make-concat :left state :right literal))
-
-                           (null literal)))))
-
-                (:either
-                 (unless buffer
-                   (setf buffer (make-buffer)))
-                 (vector-push-extend current buffer)
-                 (setf state (finalize-buffer buffer state)
-                       buffer nil))
-
+                 (carry-over-buffer state)
+                 (push (make-literal :text (format nil "~a" current))
+                       (concat-children (state-root state))))
                 (t
-                 (unless buffer
-                   (setf buffer (make-buffer)))
-                 (vector-push-extend current buffer)))))
+                 (vector-push-extend current (state-buffer state))))))
         finally
-           (return (finalize-buffer buffer state))))
+           (carry-over-buffer state)
+           (reconstruct nil state)
+           (return state)))
